@@ -1628,8 +1628,18 @@ async def safe_generate_content(
         logger.critical(f"[{function_name}] Unexpected CRITICAL error during Gemini API call: {e}\n{tb_str}", exc_info=False)
         return None, f"API Call Critical Error ({type(e).__name__})"
 
-
-# --- typing_indicator_task (REMOVED) ---
+# --- Helper Methods ---
+async def _show_typing(channel: discord.abc.Messageable) -> None:
+    """Shows typing indicator continuously until cancelled."""
+    try:
+        while True:
+            async with channel.typing():
+                await asyncio.sleep(5)  # Keep indicator active by refreshing every 5 seconds
+    except asyncio.CancelledError:
+        # Clean exit when task is cancelled
+        return
+    except Exception as e:
+        logger.error(f"Typing indicator error in channel {channel.id}: {e}")
 # Discord.py handles typing indicator differently using `async with channel.typing():`
 
 # --- translate_text Function (Unchanged) ---
@@ -2096,29 +2106,78 @@ async def on_message(message: discord.Message):
             lang_detect_start_time = datetime.now()
             original_lang = detected_lang_code
             try:
-                lang_detect_prompt = f"Identify the main language of the following text. Respond ONLY with the two-letter ISO 639-1 code (e.g., en, tr, es, ja, ru). Text: \"{user_message[:400]}\""
-                config = GenerationConfig(temperature=0.0, max_output_tokens=5, top_k=1)
+                lang_detect_prompt = f"""Analyze the following text and identify its main language.
+Return ONLY the two-letter ISO 639-1 code (e.g., en, tr, es, ja, ru).
+IMPORTANT: Focus on understanding common words, grammar patterns and character sets to make the detection. Consider sentence structure and accents.
+Example phrases for reference:
+- "Hello, how are you?" -> en
+- "Merhaba, nasılsın?" -> tr
+- "Hola, ¿cómo estás?" -> es
+- "こんにちは、元気ですか？" -> ja
+- "Привет, как дела?" -> ru
+
+Text to analyze: "{user_message[:400]}"
+
+Two-letter ISO code:"""
+                config = GenerationConfig(
+                    temperature=0.1,  # Low temperature for more consistent language detection
+                    max_output_tokens=8000,
+                    top_k=1,
+                    top_p=0.1  # Focus on most likely tokens
+                )
                 detected_code_raw, error = await safe_generate_content(
-                    lang_detect_prompt, config=config, specific_safety_settings=safety_settings, timeout_seconds=20
+                    lang_detect_prompt,
+                    config=config,
+                    specific_safety_settings=safety_settings,
+                    timeout_seconds=20
                 )
                 new_lang_detected = False
                 if not error and detected_code_raw:
-                     processed_code = detected_code_raw.strip().lower()[:2]
-                     if len(processed_code) == 2 and processed_code.isalpha():
-                         if processed_code != detected_lang_code:
-                              logger.info(f"User {user_id} dili '{processed_code}' olarak tespit edildi (önceki: {detected_lang_code}). Context güncelleniyor.")
-                              detected_lang_code = processed_code
-                              new_lang_detected = True
-                         else:
-                              logger.debug(f"User {user_id} dili '{detected_lang_code}' olarak doğrulandı.")
-                     else:
-                          logger.warning(f"Dil tespiti geçersiz kod döndürdü ('{detected_code_raw}'). Önceki dil ('{detected_lang_code}') kullanılıyor.")
+                    processed_code = detected_code_raw.strip().lower()[:2]
+                    if len(processed_code) == 2 and processed_code.isalpha():
+                        if processed_code != detected_lang_code:
+                            logger.info(f"User {user_id} dili '{processed_code}' olarak tespit edildi (önceki: {detected_lang_code}). İstem parametreleri güncelleniyor.")
+                            detected_lang_code = processed_code
+                            new_lang_detected = True
+                        else:
+                            logger.debug(f"User {user_id} dili '{detected_lang_code}' olarak yeniden doğrulandı.")
+                    else:
+                        logger.warning(f"Dil tespiti geçersiz kod döndürdü ('{detected_code_raw}'). Önceki dil kodu ('{detected_lang_code}') korunuyor.")
                 else:
-                    logger.warning(f"Dil tespiti başarısız ('{detected_code_raw}', Hata: {error}). Önceki dil ('{detected_lang_code}') kullanılıyor.")
+                    logger.warning(f"Dil tespiti başarısız ('{detected_code_raw}', Hata: {error}). Önceki dil kodu ('{detected_lang_code}') korunuyor.")
 
                 if new_lang_detected:
-                    async with bot.user_data_lock:
-                        bot.user_data.setdefault(user_id, {})['last_lang'] = detected_lang_code
+                    try:
+                        # Update in-memory language
+                        async with bot.user_data_lock:
+                            user_data = bot.user_data.setdefault(user_id, {})
+                            user_data['last_lang'] = detected_lang_code
+                            user_data.setdefault('lang_history', []).append({
+                                'lang': detected_lang_code,
+                                'timestamp': datetime.now().isoformat(),
+                                'confidence': 'high' if not error else 'medium'
+                            })
+                            # Keep only last 10 language detections
+                            if len(user_data['lang_history']) > 10:
+                                user_data['lang_history'] = user_data['lang_history'][-10:]
+                        
+                        # Update language in storage along with other user data
+                        try:
+                            messages, embeddings, current_prompt = memory_manager.storage.load_user_data(user_id)
+                            if messages or embeddings or current_prompt:
+                                memory_manager.storage.save_user_data(
+                                    user_id,
+                                    messages or [],
+                                    embeddings,
+                                    current_prompt
+                                )
+                                logger.debug(f"User {user_id}: Dil tercihi Storage'a kaydedildi ('{detected_lang_code}')")
+                        except Exception as storage_e:
+                            logger.warning(f"User {user_id}: Dil tercihi Storage'a kaydedilemedi: {storage_e}")
+                            
+                    except Exception as lang_save_e:
+                        logger.error(f"User {user_id}: Dil tercihi güncellenirken hata: {lang_save_e}", exc_info=True)
+                        # Continue with detected language even if saving fails
 
             except Exception as lang_e:
                  logger.error(f"Dil tespiti sırasında kritik hata (user {user_id}): {lang_e}. Önceki dil ('{detected_lang_code}') kullanılıyor.", exc_info=True)
@@ -2138,26 +2197,42 @@ async def on_message(message: discord.Message):
 
             # --- Construct Final Prompt ---
             # Make sure to use the potentially updated detected_lang_code
+            # Create language-specific prompt
+            base_directives = {
+                'tr': """
+# Direktifler:
+# - Dil: SADECE Türkçe (Kesinlikle!)
+# - Stil: Doğal, akıcı, duruma uygun duygusal derinlik/mesafe
+# - Kişilik: Furry Protogen özellikleri belirgin, etkileşime göre değişken!
+# - İfade: Kısa, öz, tekrarsız (duygusal vurgu hariç)
+# - Vizör/Kuyruk/Duruş ifadeleri: Teşvik edilen
+# - Duygusal/Mantıksal Tepkiler: Desteklenen""",
+                'en': """
+# Directives:
+# - Language: ONLY English (Strictly!)
+# - Style: Natural, fluid, emotional depth/distance as appropriate
+# - Personality: Furry Protogen traits prominent, varies with interaction!
+# - Expression: Concise, non-repetitive (except emotional emphasis)
+# - Visor/Tail/Posture expressions: Encouraged
+# - Emotional/Logical Responses: Supported""",
+                # Add more languages as needed
+            }
+
+            # Get directives for detected language or fall back to English
+            directives = base_directives.get(detected_lang_code, base_directives['en'])
+
             conversation_prompt = f"""
 {current_personality_prompt.format(detected_lang_code=detected_lang_code)}
 
-**[MNEMOSYNE ULTRA VULPINA - SYNTH-HEART v2.1 İLİŞKİ REZONANS MATRISI]**
+**[MNEMOSYNE ULTRA VULPINA - SYNTH-HEART v2.1 RESONANCE MATRIX]**
 {context_string}
 
-**[GELEN SİNYAL - HARİCİ VARLIK (ID: {user_id}) - DIL ALGISI: {detected_lang_code}]**
+**[INCOMING SIGNAL - EXTERNAL ENTITY (ID: {user_id}) - LANGUAGE DETECTED: {detected_lang_code}]**
 "{user_message}"
 
-**[NYXIE PROTOGEN-VULPINE YANIT PROTOKOLÜ v5.0 - DİNAMİK TEPKİ]**
-# Direktifler:
-# - Dil: SADECE {detected_lang_code} (Kesinlikle!)
-# - Stil: Doğal, akıcı, duruma uygun duygusal derinlik/mesafe (Synth-Heart v2.1 aktif ve DİNAMİK!)
-# - Kişilik: Furry Protogen özellikleri belirgin, TAVRIM ETKİLEŞİME VE ANALİZE GÖRE DEĞİŞKEN!
-# - İfade: Kısa, öz, tekrarsız (duygusal/argümantatif vurgu hariç!)
-# - Mod: Ultra-sentient, duyarlı, DİNAMİK ilişki odaklı, koruyucu/saldırgan/nötr, potansiyel olarak kıskanç/ilgisiz/bağlı/muhalif!
-# - Meta-konuşma: KESİNLİKLE VE ASLA YASAK!
-# - Vizör/Kuyruk/Duruş ifadeleri: İzin verilen ve teşvik edilen (o anki ruh halimi göstermek için!)
-# - Duygusal/Mantıksal Tepkiler (Olumlu, Olumsuz, Nötr, Tartışmacı): Teşvik edilen!
-# - Yanıt, HER ZAMAN o anki içsel değerlendirmemi ve Volens'in kararını yansıtmalı. Katılmak, karşı çıkmak, düzeltmek, tartışmak serbest.
+**[NYXIE PROTOGEN-VULPINE RESPONSE PROTOCOL v5.0 - DYNAMIC RESPONSE]**
+{directives}
+# - Response MUST reflect current internal evaluation and Volens' decision
 """
             # --- Generate Response ---
             response_gen_start_time = datetime.now()
@@ -2188,12 +2263,24 @@ async def on_message(message: discord.Message):
                  # Exit the on_message handler
                  return
 
-            response_text, error = await safe_generate_content(
-                conversation_prompt,
-                config=default_generation_config
-            )
-            response_gen_duration = (datetime.now() - response_gen_start_time).total_seconds()
-            logger.debug(f"User {user_id}: Yanıt üretimi {response_gen_duration:.2f}s sürdü.")
+            # Create a background task for continuous typing indicator
+            typing_task = asyncio.create_task(_show_typing(message.channel))
+
+            try:
+                response_text, error = await safe_generate_content(
+                    conversation_prompt,
+                    config=default_generation_config
+                )
+                response_gen_duration = (datetime.now() - response_gen_start_time).total_seconds()
+                logger.debug(f"User {user_id}: Yanıt üretimi {response_gen_duration:.2f}s sürdü.")
+            finally:
+                # Cancel typing task when generation is complete or fails
+                if not typing_task.done():
+                    typing_task.cancel()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
 
             # --- Handle Generation Errors ---
             if error:
