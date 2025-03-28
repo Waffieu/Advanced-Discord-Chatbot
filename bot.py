@@ -84,7 +84,7 @@ logger.info(f"Ana veri dizini olarak '{BASE_DATA_DIR}' kullanılacak.")
 try:
     configure(api_key=GEMINI_API_KEY)
     # MODEL_NAME = 'gemini-1.0-pro' # Consider if flash has issues with long prompts
-    MODEL_NAME = 'gemini-2.0-flash-lite' # Default model
+    MODEL_NAME = 'gemini-2.0-flash-thinking-exp-01-21' # Default model
     model = GenerativeModel(MODEL_NAME)
     logger.info(f"Gemini modeli '{MODEL_NAME}' başarıyla yapılandırıldı.")
 except google_api_exceptions.NotFound as nf_err:
@@ -1384,7 +1384,7 @@ default_generation_config = GenerationConfig(
     top_k=70,
     top_p=0.97,
     candidate_count=1,
-    max_output_tokens=500 # Increased default slightly, might need more adjustment
+    max_output_tokens=8000 # Increased default slightly, might need more adjustment
 )
 
 # --- safe_generate_content Function (Unchanged) ---
