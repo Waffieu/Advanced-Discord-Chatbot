@@ -2389,6 +2389,11 @@ Hata Kodu: {error_code}
             sent_message_ids = []
             chunks_sent = 0
 
+            # JSON formatında cevap vermeyi engelle
+            if response_text.strip().startswith('{') and response_text.strip().endswith('}'):
+                response_text = "Botun JSON formatında cevap verme davranışı düzeltildi. Artık normal metin formatında iletişim kuracağım."
+                logger.info(f"User {user_id}: JSON formatı algılandı, düzeltme uygulandı.")
+
             if response_length <= MAX_CHUNK_SIZE:
                  # No complex escaping needed, just send
                  sent_msg = await message.reply(response_text)
